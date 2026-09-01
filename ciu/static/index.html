@@ -1,0 +1,328 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CIU</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --paper:#E8E9E4;
+    --ink:#1F2429;
+    --ink-soft:#5A6169;
+    --rule:#C6C9C1;
+    --weights:#33526E;
+    --cache:#6F8F74;
+    --other:#A9ADA4;
+    --free:#CBCFC7;
+    --warn:#9A4A2C;
+    --ok:#3D6B45;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;padding:0}
+  body{
+    background:var(--paper); color:var(--ink);
+    font-family:Archivo,system-ui,sans-serif;
+    font-size:16px; line-height:1.5;
+    font-variant-numeric:tabular-nums;
+    -webkit-font-smoothing:antialiased;
+  }
+  .wrap{max-width:940px;margin:0 auto;padding:48px 28px 96px}
+
+  h1{
+    font-size:15px;font-weight:600;letter-spacing:.02em;
+    margin:0 0 4px;
+  }
+  .machine{
+    display:flex;flex-wrap:wrap;gap:6px 20px;align-items:baseline;
+    padding-bottom:22px;border-bottom:1px solid var(--rule);margin-bottom:40px;
+  }
+  .machine .dev{font-size:26px;font-weight:600;letter-spacing:-.02em;line-height:1.15}
+  .machine .meta{color:var(--ink-soft);font-size:14px}
+  .machine .note{flex-basis:100%;color:var(--warn);font-size:13px;margin-top:2px}
+
+  /* the allocation bar: the point of the whole page */
+  .alloc{margin-bottom:14px}
+  .bar{
+    display:flex;height:76px;width:100%;
+    border:1px solid var(--ink);overflow:hidden;
+  }
+  .seg{position:relative;transition:flex-grow .45s cubic-bezier(.4,0,.2,1)}
+  .seg.w{background:var(--weights)}
+  .seg.k{background:var(--cache)}
+  .seg.o{background:var(--other)}
+  .seg.f{background:var(--free)}
+  .seg + .seg{border-left:1px solid var(--ink)}
+  .legend{display:flex;gap:28px;flex-wrap:wrap;margin-top:12px;font-size:14px}
+  .legend div{display:flex;align-items:baseline;gap:8px}
+  .swatch{width:11px;height:11px;flex:none;border:1px solid var(--ink)}
+  .legend b{font-weight:600}
+  .legend span{color:var(--ink-soft)}
+
+  .headroom{
+    font-size:44px;font-weight:700;letter-spacing:-.03em;
+    margin:34px 0 2px;line-height:1;
+  }
+  .headroom small{font-size:17px;font-weight:400;color:var(--ink-soft);letter-spacing:0}
+  .headroom-note{color:var(--ink-soft);font-size:14px;max-width:62ch;margin-bottom:44px}
+
+  h2{font-size:15px;font-weight:600;margin:0 0 14px;letter-spacing:.01em}
+
+  .rows{border-top:1px solid var(--rule)}
+  .row{
+    display:grid;grid-template-columns:1fr auto auto;gap:20px;align-items:center;
+    padding:18px 0;border-bottom:1px solid var(--rule);
+  }
+  .row .nm{font-weight:600;font-size:17px;letter-spacing:-.01em}
+  .row .sub{color:var(--ink-soft);font-size:13.5px;margin-top:3px;max-width:58ch}
+  .row .fig{text-align:right;font-size:14px;color:var(--ink-soft);white-space:nowrap}
+  .row .fig b{display:block;color:var(--ink);font-size:19px;font-weight:600}
+  .row.no{opacity:.5}
+
+  button{
+    font:inherit;font-weight:500;font-size:14px;
+    background:var(--ink);color:var(--paper);
+    border:1px solid var(--ink);padding:9px 18px;cursor:pointer;
+    border-radius:0;
+  }
+  button.ghost{background:transparent;color:var(--ink)}
+  button:disabled{opacity:.35;cursor:default}
+  button:focus-visible{outline:2px solid var(--weights);outline-offset:2px}
+
+  .connect{margin-top:52px;padding-top:26px;border-top:1px solid var(--rule)}
+  code{
+    font-family:Archivo,monospace;font-weight:500;
+    background:#DDDFD9;padding:3px 8px;border:1px solid var(--rule);
+  }
+  .url{font-size:20px;font-weight:600;margin:10px 0 8px;letter-spacing:-.01em}
+  .connect p{color:var(--ink-soft);font-size:14px;max-width:64ch}
+
+  .state{font-size:14px;color:var(--ink-soft);margin-bottom:10px;min-height:21px}
+  .state.err{color:var(--warn)}
+  .state.ready{color:var(--ok)}
+  pre{
+    background:#DDDFD9;border:1px solid var(--rule);padding:12px;
+    font-size:12px;line-height:1.45;max-height:190px;overflow:auto;
+    white-space:pre-wrap;color:var(--ink-soft);margin:10px 0 0;
+  }
+  @media (prefers-reduced-motion:reduce){.seg{transition:none}}
+  @media (max-width:620px){
+    .row{grid-template-columns:1fr;gap:12px}
+    .row .fig{text-align:left}
+    .headroom{font-size:34px}
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <h1>CIU</h1>
+  <div class="machine">
+    <div class="dev" id="dev">Looking at your machine…</div>
+    <div class="meta" id="mem"></div>
+    <div class="note" id="hwnote"></div>
+  </div>
+
+  <div class="alloc">
+    <div class="bar" id="bar">
+      <div class="seg w" id="segW" style="flex-grow:0"></div>
+      <div class="seg k" id="segK" style="flex-grow:0"></div>
+      <div class="seg o" id="segO" style="flex-grow:0"></div>
+      <div class="seg f" id="segF" style="flex-grow:1"></div>
+    </div>
+    <div class="legend">
+      <div><span class="swatch" style="background:var(--weights)"></span><b id="lw">—</b><span>model weights</span></div>
+      <div><span class="swatch" style="background:var(--cache)"></span><b id="lk">—</b><span>conversation memory</span></div>
+      <div><span class="swatch" style="background:var(--other)"></span><b id="lo">—</b><span>other apps</span></div>
+      <div><span class="swatch" style="background:var(--free)"></span><b id="lf">—</b><span>free</span></div>
+    </div>
+  </div>
+
+  <div class="headroom" id="headroom">—</div>
+  <div class="headroom-note" id="headnote">
+    Load a model to see how much conversation it will hold.
+  </div>
+
+  <h2>Models</h2>
+  <div class="rows" id="rows"></div>
+
+  <div class="connect">
+    <h2>Connect an app</h2>
+    <div class="state" id="state"></div>
+    <div class="url" id="url">http://127.0.0.1:8674/v1</div>
+    <p>Anything that talks to OpenAI talks to CIU. Point the tool at this
+       address and give it any API key. The model stays loaded once, and every
+       app shares it.</p>
+    <pre id="log" hidden></pre>
+  </div>
+
+</div>
+
+<script>
+const GIB = 1024 ** 3;
+let busy = false;
+
+function tokens(n){
+  if (n >= 1000) return Math.round(n/1000) + "k";
+  return String(n);
+}
+
+function render(s){
+  const hw = s.hardware;
+  document.getElementById("dev").textContent = hw.device_name;
+  document.getElementById("mem").textContent =
+    `${hw.backend} · ${hw.free_gib} of ${hw.total_gib} GiB free`;
+  document.getElementById("hwnote").textContent = hw.note || "";
+
+  // allocation bar
+  const r = s.runner;
+  const loaded = s.models.find(m => r.model_path && r.model_path.includes(m.filename));
+  let w = 0, k = 0;
+  if (loaded && r.state === "ready"){
+    w = loaded.size_gib + loaded.budget.overhead_gib;
+    k = (r.n_ctx * loaded.kv_per_token) / GIB;
+  }
+  // The bar shows the whole pool. Memory other applications hold is drawn
+  // too, otherwise the picture contradicts the free figure in the header.
+  const total = hw.total_gib;
+  const other = Math.max(total - hw.free_gib - w - k, 0);
+  const f = Math.max(hw.free_gib - w - k, 0);
+  document.getElementById("segW").style.flexGrow = w;
+  document.getElementById("segK").style.flexGrow = k;
+  document.getElementById("segO").style.flexGrow = other;
+  document.getElementById("segF").style.flexGrow = f;
+  document.getElementById("lw").textContent = w ? w.toFixed(1) + " GiB" : "—";
+  document.getElementById("lk").textContent = k ? k.toFixed(2) + " GiB" : "—";
+  document.getElementById("lo").textContent = other ? other.toFixed(1) + " GiB" : "—";
+  document.getElementById("lf").textContent = f.toFixed(1) + " GiB";
+
+  // headroom
+  const hr = document.getElementById("headroom");
+  const hn = document.getElementById("headnote");
+  if (loaded && r.state === "ready"){
+    const spare = Math.floor((f * GIB) / loaded.kv_per_token);
+    hr.innerHTML = `${tokens(r.n_ctx)} loaded <small>· room for ${tokens(spare)} more</small>`;
+    hn.textContent = `${loaded.name} is holding ${tokens(r.n_ctx)} tokens of `
+      + `conversation at ${loaded.kv_per_token.toLocaleString()} bytes each. `
+      + `The free memory would take another ${tokens(spare)}.`;
+  } else {
+    const best = s.models.filter(m => m.budget.fits)
+                         .sort((a,b) => b.size_gib - a.size_gib)[0];
+    if (best){
+      hr.innerHTML = `${tokens(best.suggested_ctx)} <small>· ${best.name}</small>`;
+      hn.textContent = `Your largest option is ${best.name}, and this machine `
+        + `would hold about ${tokens(best.budget.max_context)} tokens of `
+        + `conversation with it loaded.`;
+    } else {
+      const smallest = s.models.slice().sort(
+        (a,b) => (a.budget.weights_gib + a.budget.overhead_gib)
+               - (b.budget.weights_gib + b.budget.overhead_gib))[0];
+      const need = smallest
+        ? (smallest.budget.weights_gib + smallest.budget.overhead_gib) : 0;
+      hr.textContent = "Not enough free memory";
+      hn.textContent = smallest
+        ? `${smallest.name} is the smallest option and needs ${need.toFixed(1)} GiB. `
+          + `${hw.free_gib} GiB is free. Closing other applications would `
+          + `release ${(total - hw.free_gib).toFixed(1)} GiB.`
+        : "No models in the catalogue.";
+    }
+  }
+
+  // model rows
+  const rows = document.getElementById("rows");
+  rows.innerHTML = "";
+  for (const m of s.models){
+    const el = document.createElement("div");
+    el.className = "row" + (m.budget.fits ? "" : " no");
+
+    const left = document.createElement("div");
+    left.innerHTML = `<div class="nm">${m.name}</div>
+      <div class="sub">${m.quant} · ${m.notes}${m.has_mtp ? " Has a prediction head, so it decodes faster." : ""}</div>`;
+
+    const fig = document.createElement("div");
+    fig.className = "fig";
+    fig.innerHTML = m.budget.fits
+      ? `<b>${tokens(m.budget.max_context)}</b>${m.size_gib} GiB`
+      : `<b>—</b>needs ${(m.budget.weights_gib + m.budget.overhead_gib).toFixed(1)} GiB`;
+
+    const act = document.createElement("div");
+    const isLoaded = loaded && loaded.id === m.id && r.state === "ready";
+    const b = document.createElement("button");
+    if (isLoaded){
+      b.textContent = "Unload"; b.className = "ghost";
+      b.onclick = () => call("/api/unload");
+    } else if (!m.downloaded){
+      b.textContent = s.download.active && s.download.model_id === m.id
+        ? "Downloading…" : "Download";
+      b.disabled = busy || s.download.active || !m.budget.fits;
+      b.onclick = () => call(`/api/download/${m.id}`);
+    } else {
+      b.textContent = "Load";
+      b.disabled = busy || !m.budget.fits || r.state === "loading";
+      b.onclick = () => call(`/api/load/${m.id}?mtp=${m.has_mtp}`);
+    }
+    act.appendChild(b);
+
+    el.append(left, fig, act);
+    rows.appendChild(el);
+  }
+
+  // state line
+  const st = document.getElementById("state");
+  st.className = "state";
+  if (!s.llama_server){
+    st.className = "state err";
+    st.textContent = "llama-server not found. Build the NF4DQ fork, or set CIU_LLAMA_SERVER to its path.";
+  } else if (s.download.error){
+    st.className = "state err";
+    st.textContent = "Download failed: " + s.download.error;
+  } else if (r.state === "error"){
+    st.className = "state err";
+    st.textContent = r.error;
+  } else if (r.state === "loading"){
+    st.textContent = "Loading the model into memory. A 13 GiB file takes a minute or two.";
+  } else if (r.state === "ready"){
+    st.className = "state ready";
+    st.textContent = "Ready" + (r.mtp ? ", with multi-token prediction on." : ".");
+  } else {
+    st.textContent = "No model loaded.";
+  }
+
+  const log = document.getElementById("log");
+  if (r.state === "loading" || r.state === "error"){
+    log.hidden = false;
+    log.textContent = (r.log_tail || []).join("\n");
+  } else {
+    log.hidden = true;
+  }
+}
+
+async function call(path){
+  busy = true;
+  try {
+    const res = await fetch(path, {method: "POST"});
+    if (!res.ok){
+      const j = await res.json().catch(() => ({}));
+      document.getElementById("state").className = "state err";
+      document.getElementById("state").textContent = j.detail || res.statusText;
+    }
+  } finally {
+    busy = false;
+    poll();
+  }
+}
+
+async function poll(){
+  try {
+    const res = await fetch("/api/status");
+    render(await res.json());
+  } catch (e) { /* server restarting */ }
+}
+
+poll();
+setInterval(poll, 1500);
+</script>
+</body>
+</html>
