@@ -30,6 +30,7 @@ class Model:
     # Some models carry a multi-token-prediction head, which llama.cpp can use
     # for speculative decoding. Measured at 1.79x on an L4.
     has_mtp: bool = False
+    n_ctx_train: int | None = None
     tags: list[str] = field(default_factory=list)
 
     @property
@@ -59,8 +60,9 @@ CATALOG: list[Model] = [
         size_bytes=4_666_442_720,
         # Hybrid: 8 of 32 layers use full attention, the rest are linear and
         # carry a fixed recurrent state instead of a growing cache.
-        shape=ModelShape(n_layer=32, n_head_kv=8, head_dim=128, n_attn_layer=8),
+        shape=ModelShape(n_layer=32, n_head_kv=4, head_dim=256, n_attn_layer=8),
         notes="Runs on 8GB machines. Verified on an Apple M1.",
+        n_ctx_train=262144,
         tags=["small", "hybrid"],
     ),
     Model(
@@ -69,9 +71,10 @@ CATALOG: list[Model] = [
         repo="KayceeSamuel/Qwen3.8-27B-NF4DQ",
         filename="Qwen3.8-27B-NF4DQ.gguf",
         size_bytes=14_214_251_264,
-        shape=ModelShape(n_layer=64, n_head_kv=8, head_dim=128, n_attn_layer=16),
+        shape=ModelShape(n_layer=64, n_head_kv=4, head_dim=256, n_attn_layer=16),
         notes="Beats Q4_K_M on quality per gigabyte and decodes 25% faster.",
         has_mtp=True,
+        n_ctx_train=262144,
         tags=["large", "hybrid"],
     ),
 ]

@@ -19,7 +19,8 @@ import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
 
-from .budget import GIB, budget_for, round_context
+from .budget import (GIB, budget_for, context_options, plan_offload,
+                     round_context)
 from .catalog import CATALOG, by_id
 from .gguf_read import read_shape
 from .hardware import detect
@@ -82,12 +83,22 @@ def status():
         downloaded = path.is_file()
         shape = shape_for(m)
         b = budget_for(m.size_bytes, shape, available)
+        opts = context_options(b, m.n_ctx_train)
+        # Default to the largest context that fits, or the smallest offered if
+        # none do (partial offload will handle the shortfall).
+        fitting = [o for o in opts if o["fits"]]
+        default_ctx = fitting[-1]["n_ctx"] if fitting else opts[0]["n_ctx"]
+
         entry = m.to_dict()
         entry.update({
             "downloaded": downloaded,
             "budget": b.to_dict(),
             "suggested_ctx": round_context(b.max_context),
             "kv_per_token": b.kv_per_token,
+            "contexts": opts,
+            "default_ctx": default_ctx,
+            "n_layer": shape.n_layer,
+            "offload": plan_offload(b, shape.n_layer, default_ctx),
         })
         models.append(entry)
 
@@ -143,26 +154,32 @@ def load(model_id: str, n_ctx: int | None = None, mtp: bool = False):
     hw = detect()
     shape = shape_for(model)
     b = budget_for(model.size_bytes, shape, hw.free_bytes)
-    if not b.fits:
+
+    ctx = n_ctx or (round_context(b.max_context) if b.fits else 2048)
+
+    # A model that does not fit entirely is not refused. Split it: the first N
+    # layers go on the GPU and the rest run on CPU. Slow, but running.
+    plan = plan_offload(b, shape.n_layer, ctx)
+    if plan["n_gpu_layers"] == 0 and hw.backend != "cpu":
         raise HTTPException(
             400,
-            f"{model.name} needs {b.fixed_bytes / GIB:.1f} GiB but only "
-            f"{hw.free_gib:.1f} GiB is free",
+            f"Only {hw.free_gib:.1f} GiB is free. Not even one layer of "
+            f"{model.name} fits alongside {ctx} tokens of context.",
         )
 
-    ctx = n_ctx or round_context(b.max_context)
-    if ctx > b.max_context:
-        raise HTTPException(
-            400, f"{ctx} tokens needs more memory than is free "
-                 f"(max {b.max_context})")
+    # Batch size drives a compute buffer that is charged whatever the context.
+    # Keep it small when memory is tight.
+    n_batch = 128 if not plan["full"] else None
 
     runner.start(RunConfig(
         model_path=str(path),
         n_ctx=ctx,
         backend=hw.backend,
         use_mtp=mtp and model.has_mtp,
+        n_gpu_layers=plan["n_gpu_layers"],
+        n_batch=n_batch,
     ))
-    return {"loading": True, "n_ctx": ctx}
+    return {"loading": True, "n_ctx": ctx, "offload": plan}
 
 
 @app.post("/api/unload")

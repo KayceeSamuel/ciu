@@ -17,11 +17,8 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-BACKEND_FLAGS = {
-    "cuda":  ["-ngl", "99"],
-    "metal": ["-ngl", "99"],
-    "cpu":   ["-ngl", "0"],
-}
+# Backends that can hold layers in device memory. CPU never can.
+GPU_BACKENDS = ("cuda", "metal")
 
 
 def find_llama_server() -> str | None:
@@ -60,6 +57,10 @@ class RunConfig:
     use_mtp: bool = False
     draft_n_max: int = 4
     flash_attn: bool = True
+    # 99 offloads everything. A smaller number splits the model, keeping the
+    # first N layers on the GPU and running the rest on CPU.
+    n_gpu_layers: int = 99
+    n_batch: int | None = None
 
 
 class LlamaRunner:
@@ -87,9 +88,17 @@ class LlamaRunner:
             "--port", str(port),
             "--jinja",
         ]
-        args += BACKEND_FLAGS.get(cfg.backend, BACKEND_FLAGS["cpu"])
-        if cfg.flash_attn and cfg.backend != "cpu":
+        ngl = cfg.n_gpu_layers if cfg.backend in GPU_BACKENDS else 0
+        args += ["-ngl", str(ngl)]
+
+        if cfg.flash_attn and ngl > 0:
             args += ["-fa", "on"]
+
+        # llama-server reserves a compute buffer sized by the batch, not by
+        # the context. The 2048 default costs hundreds of megabytes, which is
+        # the difference between loading and failing on a tight machine.
+        if cfg.n_batch:
+            args += ["-b", str(cfg.n_batch), "-ub", str(cfg.n_batch)]
         if cfg.use_mtp:
             # Measured 1.79x on an L4, 1.54x on an A100. Depth 4 was the peak
             # of a sweep; 8 collapsed badly, so it is not exposed as a dial.
@@ -178,5 +187,6 @@ class LlamaRunner:
             "model_path": self.config.model_path if self.config else None,
             "n_ctx": self.config.n_ctx if self.config else None,
             "mtp": self.config.use_mtp if self.config else False,
+            "n_gpu_layers": self.config.n_gpu_layers if self.config else None,
             "log_tail": self.log[-25:],
         }

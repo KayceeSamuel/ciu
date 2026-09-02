@@ -91,6 +91,17 @@
   button:disabled{opacity:.35;cursor:default}
   button:focus-visible{outline:2px solid var(--weights);outline-offset:2px}
 
+  .ctx{display:flex;gap:6px;flex-wrap:wrap;margin-top:10px}
+  .ctx button{
+    padding:5px 11px;font-size:13px;background:transparent;color:var(--ink);
+    border:1px solid var(--rule);
+  }
+  .ctx button.on{background:var(--ink);color:var(--paper);border-color:var(--ink)}
+  .ctx button.part{border-style:dashed;color:var(--ink-soft)}
+  .ctx button:disabled{opacity:.3}
+  .split{font-size:13px;color:var(--ink-soft);margin-top:8px;max-width:60ch}
+  .split b{color:var(--warn);font-weight:500}
+
   .connect{margin-top:52px;padding-top:26px;border-top:1px solid var(--rule)}
   code{
     font-family:Archivo,monospace;font-weight:500;
@@ -163,6 +174,7 @@
 <script>
 const GIB = 1024 ** 3;
 let busy = false;
+const chosen = {};   // model id -> context length the user picked
 
 function tokens(n){
   if (n >= 1000) return Math.round(n/1000) + "k";
@@ -181,14 +193,21 @@ function render(s){
   const loaded = s.models.find(m => r.model_path && r.model_path.includes(m.filename));
   let w = 0, k = 0;
   if (loaded && r.state === "ready"){
-    w = loaded.size_gib + loaded.budget.overhead_gib;
+    // On a split offload only some layers are resident on the device. Show
+    // what is actually there, not the whole file.
+    const ngl = r.n_gpu_layers;
+    const frac = (ngl !== undefined && ngl !== null && ngl < 99 && loaded.n_layer)
+      ? Math.min(ngl / loaded.n_layer, 1) : 1;
+    w = loaded.size_gib * frac + loaded.budget.overhead_gib;
     k = (r.n_ctx * loaded.kv_per_token) / GIB;
   }
-  // The bar shows the whole pool. Memory other applications hold is drawn
-  // too, otherwise the picture contradicts the free figure in the header.
+  // The bar shows the whole pool. Once a model is loaded its memory is
+  // already counted in what the system reports as used, so the weights and
+  // cache segments are carved OUT of the used portion rather than added to
+  // it. Adding them would count the model twice and drive free to zero.
   const total = hw.total_gib;
   const other = Math.max(total - hw.free_gib - w - k, 0);
-  const f = Math.max(hw.free_gib - w - k, 0);
+  const f = Math.max(hw.free_gib, 0);
   document.getElementById("segW").style.flexGrow = w;
   document.getElementById("segK").style.flexGrow = k;
   document.getElementById("segO").style.flexGrow = other;
@@ -202,11 +221,16 @@ function render(s){
   const hr = document.getElementById("headroom");
   const hn = document.getElementById("headnote");
   if (loaded && r.state === "ready"){
+    // What the remaining free memory would buy in extra context.
     const spare = Math.floor((f * GIB) / loaded.kv_per_token);
     hr.innerHTML = `${tokens(r.n_ctx)} loaded <small>· room for ${tokens(spare)} more</small>`;
+    const ngl = r.n_gpu_layers;
+    const split = (ngl !== undefined && ngl !== null && ngl < 99 && loaded.n_layer)
+      ? ` ${ngl} of ${loaded.n_layer} layers are on the GPU and the rest run `
+        + `on the CPU, so generation is slower than a full offload.` : "";
     hn.textContent = `${loaded.name} is holding ${tokens(r.n_ctx)} tokens of `
       + `conversation at ${loaded.kv_per_token.toLocaleString()} bytes each. `
-      + `The free memory would take another ${tokens(spare)}.`;
+      + `The free memory would take another ${tokens(spare)}.` + split;
   } else {
     const best = s.models.filter(m => m.budget.fits)
                          .sort((a,b) => b.size_gib - a.size_gib)[0];
@@ -256,17 +280,61 @@ function render(s){
     } else if (!m.downloaded){
       b.textContent = s.download.active && s.download.model_id === m.id
         ? "Downloading…" : "Download";
-      b.disabled = busy || s.download.active || !m.budget.fits;
+      b.disabled = busy || s.download.active;
       b.onclick = () => call(`/api/download/${m.id}`);
     } else {
       b.textContent = "Load";
-      b.disabled = busy || !m.budget.fits || r.state === "loading";
-      b.onclick = () => call(`/api/load/${m.id}?mtp=${m.has_mtp}`);
+      b.disabled = busy || r.state === "loading"
+                || (chosen[m.id] === undefined ? false : false);
+      b.onclick = () => call(
+        `/api/load/${m.id}?mtp=${m.has_mtp}&n_ctx=${chosen[m.id] || m.default_ctx}`);
     }
     act.appendChild(b);
 
     el.append(left, fig, act);
     rows.appendChild(el);
+
+    // Context choice. Shown for downloaded models only: before download the
+    // question is whether to get it at all.
+    if (m.downloaded && !isLoaded && m.contexts){
+      const pick = chosen[m.id] || m.default_ctx;
+      const chips = document.createElement("div");
+      chips.className = "ctx";
+      chips.style.gridColumn = "1 / -1";
+
+      for (const o of m.contexts){
+        const c = document.createElement("button");
+        c.textContent = tokens(o.n_ctx);
+        c.className = (o.n_ctx === pick ? "on " : "") + (o.fits ? "" : "part");
+        c.title = `${o.total_gib} GiB needed` + (o.fits ? "" : " — needs a CPU split");
+        c.onclick = () => { chosen[m.id] = o.n_ctx; poll(); };
+        chips.appendChild(c);
+      }
+      el.appendChild(chips);
+
+      // What loading at the chosen length would actually do
+      const opt = m.contexts.find(o => o.n_ctx === pick);
+      const note = document.createElement("div");
+      note.className = "split";
+      note.style.gridColumn = "1 / -1";
+      if (opt && opt.fits){
+        note.textContent =
+          `${tokens(pick)} of context needs ${opt.total_gib} GiB. `
+          + `All ${m.n_layer} layers run on the GPU.`;
+      } else if (opt){
+        const gpu = Math.max(Math.floor(
+          ((hw.free_gib - m.budget.overhead_gib - opt.kv_gib) /
+           (m.budget.weights_gib / m.n_layer)) - 1), 0);
+        note.innerHTML = opt.total_gib > hw.free_gib && gpu > 0
+          ? `${tokens(pick)} of context needs ${opt.total_gib} GiB and `
+            + `${hw.free_gib} GiB is free. CIU would put <b>${gpu} of `
+            + `${m.n_layer} layers</b> on the GPU and run the rest on the CPU. `
+            + `That works, but it is much slower than a full offload.`
+          : `${tokens(pick)} of context needs ${opt.total_gib} GiB. `
+            + `Not enough is free for even a partial split.`;
+      }
+      el.appendChild(note);
+    }
   }
 
   // state line
@@ -285,7 +353,9 @@ function render(s){
     st.textContent = "Loading the model into memory. A 13 GiB file takes a minute or two.";
   } else if (r.state === "ready"){
     st.className = "state ready";
-    st.textContent = "Ready" + (r.mtp ? ", with multi-token prediction on." : ".");
+    const split = (r.n_gpu_layers !== undefined && r.n_gpu_layers < 99)
+      ? ` ${r.n_gpu_layers} layers on the GPU, the rest on the CPU.` : "";
+    st.textContent = "Ready" + (r.mtp ? ", with multi-token prediction on." : ".") + split;
   } else {
     st.textContent = "No model loaded.";
   }

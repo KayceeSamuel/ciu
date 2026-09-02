@@ -126,3 +126,59 @@ def human_tokens(n: int) -> str:
     if n >= 1000:
         return f"{n / 1000:.0f}k"
     return str(n)
+
+
+# Context lengths worth offering. Users recognise these; they do not recognise
+# 41,318.
+CONTEXT_STEPS = (2048, 4096, 8192, 16384, 32768, 65536, 131072)
+
+
+def context_options(b: "Budget", n_ctx_train: int | None = None) -> list[dict]:
+    """Every offerable context length with what it would cost.
+
+    Includes lengths that do not fit, marked as such, because "8k needs 5.6 GiB
+    and you have 3.4" is more useful than hiding the option.
+    """
+    cap = n_ctx_train or CONTEXT_STEPS[-1]
+    out = []
+    for n in CONTEXT_STEPS:
+        if n > cap:
+            break
+        total = b.fixed_bytes + b.kv_bytes_at(n)
+        out.append({
+            "n_ctx": n,
+            "total_gib": round(total / GIB, 2),
+            "kv_gib": round(b.kv_bytes_at(n) / GIB, 3),
+            "fits": total <= b.available_bytes,
+        })
+    return out
+
+
+def plan_offload(b: "Budget", n_layer: int, n_ctx: int) -> dict:
+    """How many layers will fit on the GPU.
+
+    A model that does not fit entirely is not a dead end. llama.cpp will put
+    the first N layers on the GPU and run the rest on CPU. That is much slower
+    than full offload but vastly faster than no offload at all, and on a
+    machine where the model is only slightly too large it is the difference
+    between running and not running.
+    """
+    needed = b.fixed_bytes + b.kv_bytes_at(n_ctx)
+    if needed <= b.available_bytes:
+        return {"n_gpu_layers": 99, "full": True, "layers_on_gpu": n_layer,
+                "n_layer": n_layer}
+
+    # Weights dominate and divide roughly evenly across layers. The KV cache
+    # and overhead have to be resident regardless.
+    per_layer = b.weights_bytes / max(n_layer, 1)
+    spare = b.available_bytes - b.overhead_bytes - b.kv_bytes_at(n_ctx)
+    if spare <= 0:
+        return {"n_gpu_layers": 0, "full": False, "layers_on_gpu": 0,
+                "n_layer": n_layer}
+
+    # Leave one layer of slack: the estimate is approximate and an allocation
+    # failure mid-load is worse than one fewer layer.
+    fit = max(int(spare // per_layer) - 1, 0)
+    fit = min(fit, n_layer)
+    return {"n_gpu_layers": fit, "full": False, "layers_on_gpu": fit,
+            "n_layer": n_layer}

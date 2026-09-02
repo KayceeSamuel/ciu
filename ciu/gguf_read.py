@@ -89,15 +89,34 @@ def read_shape(path: str) -> tuple[ModelShape | None, dict]:
 
     head_dim = _kv(r, f"{prefix}attention.key_length") or (n_embd // n_head)
 
-    # Hybrid architectures interleave full attention with linear attention.
-    # Only the full-attention layers keep a cache that grows per token, so
-    # counting all layers would overstate KV cost several-fold. llama.cpp
-    # records the recurrent layer count where the architecture has one.
+    # Hybrid architectures interleave full attention with linear or
+    # state-space layers. Only full-attention layers keep a cache that grows
+    # per token; the rest carry a fixed-size state. Counting every layer
+    # overstates KV cost several-fold, which is the difference between
+    # "16k fits" and "4k fits".
+    #
+    # Qwen records this as full_attention_interval: every Nth layer uses full
+    # attention. Interval 4 over 32 layers means 8 cache-bearing layers.
     n_attn_layer = None
-    linear_count = _kv(r, f"{prefix}recurrent_layer_count",
-                       f"{prefix}linear_attention.layer_count")
-    if linear_count and 0 < linear_count < n_layer:
-        n_attn_layer = n_layer - linear_count
+    interval = _kv(r, f"{prefix}full_attention_interval")
+    if interval and interval > 1:
+        n_attn_layer = n_layer // interval
+
+    if n_attn_layer is None:
+        # Other architectures state it as a count of recurrent layers.
+        linear_count = _kv(r, f"{prefix}recurrent_layer_count",
+                           f"{prefix}linear_attention.layer_count")
+        if linear_count and 0 < linear_count < n_layer:
+            n_attn_layer = n_layer - linear_count
+
+    # A state-space block is a strong signal the model is hybrid. If we could
+    # not work out the split, say nothing rather than assuming every layer
+    # caches: the caller keeps its own recorded value, which is better than a
+    # confidently wrong one.
+    is_hybrid = any(k.startswith(f"{prefix}ssm.") for k in r.fields)
+    if n_attn_layer is None and is_hybrid:
+        return None, {"architecture": arch, "hybrid": True,
+                      "reason": "hybrid model with no recorded attention split"}
 
     meta = {
         "architecture": arch,
@@ -108,6 +127,7 @@ def read_shape(path: str) -> tuple[ModelShape | None, dict]:
         "head_dim": head_dim,
         "n_ctx_train": n_ctx_train,
         "n_attn_layer": n_attn_layer,
+        "full_attention_interval": interval,
     }
     return ModelShape(n_layer=n_layer, n_head_kv=n_head_kv,
                       head_dim=head_dim, n_attn_layer=n_attn_layer), meta
