@@ -193,18 +193,16 @@ function render(s){
   const loaded = s.models.find(m => r.model_path && r.model_path.includes(m.filename));
   let w = 0, k = 0;
   if (loaded && r.state === "ready"){
-    // On a split offload only some layers are resident on the device. Show
-    // what is actually there, not the whole file.
-    const ngl = r.n_gpu_layers;
-    const frac = (ngl !== undefined && ngl !== null && ngl < 99 && loaded.n_layer)
-      ? Math.min(ngl / loaded.n_layer, 1) : 1;
-    w = loaded.size_gib * frac + loaded.budget.overhead_gib;
+    w = loaded.size_gib + loaded.budget.overhead_gib;
     k = (r.n_ctx * loaded.kv_per_token) / GIB;
   }
   // The bar shows the whole pool. Once a model is loaded its memory is
   // already counted in what the system reports as used, so the weights and
   // cache segments are carved OUT of the used portion rather than added to
   // it. Adding them would count the model twice and drive free to zero.
+  // hw.free_gib now excludes whatever the loaded model holds, so the three
+  // parts add up to the pool: the model, everything else running, and what is
+  // genuinely available.
   const total = hw.total_gib;
   const other = Math.max(total - hw.free_gib - w - k, 0);
   const f = Math.max(hw.free_gib, 0);
@@ -224,13 +222,11 @@ function render(s){
     // What the remaining free memory would buy in extra context.
     const spare = Math.floor((f * GIB) / loaded.kv_per_token);
     hr.innerHTML = `${tokens(r.n_ctx)} loaded <small>· room for ${tokens(spare)} more</small>`;
-    const ngl = r.n_gpu_layers;
-    const split = (ngl !== undefined && ngl !== null && ngl < 99 && loaded.n_layer)
-      ? ` ${ngl} of ${loaded.n_layer} layers are on the GPU and the rest run `
-        + `on the CPU, so generation is slower than a full offload.` : "";
     hn.textContent = `${loaded.name} is holding ${tokens(r.n_ctx)} tokens of `
       + `conversation at ${loaded.kv_per_token.toLocaleString()} bytes each. `
-      + `The free memory would take another ${tokens(spare)}.` + split;
+      + `${f.toFixed(2)} GiB is free beyond what the model has taken, enough `
+      + `for roughly ${tokens(spare)} more tokens if it were reloaded with a `
+      + `longer context. When this conversation fills up, start a new one.`;
   } else {
     const best = s.models.filter(m => m.budget.fits)
                          .sort((a,b) => b.size_gib - a.size_gib)[0];
@@ -284,8 +280,7 @@ function render(s){
       b.onclick = () => call(`/api/download/${m.id}`);
     } else {
       b.textContent = "Load";
-      b.disabled = busy || r.state === "loading"
-                || (chosen[m.id] === undefined ? false : false);
+      b.disabled = busy || r.state === "loading";
       b.onclick = () => call(
         `/api/load/${m.id}?mtp=${m.has_mtp}&n_ctx=${chosen[m.id] || m.default_ctx}`);
     }
@@ -306,7 +301,9 @@ function render(s){
         const c = document.createElement("button");
         c.textContent = tokens(o.n_ctx);
         c.className = (o.n_ctx === pick ? "on " : "") + (o.fits ? "" : "part");
-        c.title = `${o.total_gib} GiB needed` + (o.fits ? "" : " — needs a CPU split");
+        c.title = o.fits
+          ? `${o.total_gib} GiB expected`
+          : `${o.total_gib} GiB expected, more than is free — may not load`;
         c.onclick = () => { chosen[m.id] = o.n_ctx; poll(); };
         chips.appendChild(c);
       }
@@ -317,21 +314,29 @@ function render(s){
       const note = document.createElement("div");
       note.className = "split";
       note.style.gridColumn = "1 / -1";
+      const fixed = m.budget.weights_gib + m.budget.overhead_gib;
+      const spare = hw.free_gib - fixed;
+      const roomTokens = spare > 0
+        ? Math.floor((spare * GIB) / m.kv_per_token) : 0;
+
       if (opt && opt.fits){
         note.textContent =
-          `${tokens(pick)} of context needs ${opt.total_gib} GiB. `
-          + `All ${m.n_layer} layers run on the GPU.`;
+          `${tokens(pick)} of context should use ${opt.total_gib} GiB of the `
+          + `${hw.free_gib} GiB free. Weights take ${fixed.toFixed(1)} GiB, `
+          + `leaving room for about ${tokens(roomTokens)} tokens`
+          + (m.n_ctx_train && m.max_ctx < m.n_ctx_train
+             ? `; the model itself supports ${tokens(m.n_ctx_train)}.` : ".");
       } else if (opt){
-        const gpu = Math.max(Math.floor(
-          ((hw.free_gib - m.budget.overhead_gib - opt.kv_gib) /
-           (m.budget.weights_gib / m.n_layer)) - 1), 0);
-        note.innerHTML = opt.total_gib > hw.free_gib && gpu > 0
-          ? `${tokens(pick)} of context needs ${opt.total_gib} GiB and `
-            + `${hw.free_gib} GiB is free. CIU would put <b>${gpu} of `
-            + `${m.n_layer} layers</b> on the GPU and run the rest on the CPU. `
-            + `That works, but it is much slower than a full offload.`
-          : `${tokens(pick)} of context needs ${opt.total_gib} GiB. `
-            + `Not enough is free for even a partial split.`;
+        note.innerHTML =
+          `${tokens(pick)} of context is expected to need ${opt.total_gib} GiB `
+          + `and ${hw.free_gib} GiB is free, so this <b>may not load</b>. `
+          + (roomTokens > 0
+             ? `About ${tokens(roomTokens)} tokens is what the free memory `
+               + `looks like it will hold. `
+             : `The weights alone are expected to need `
+               + `${fixed.toFixed(1)} GiB. `)
+          + `The estimate is approximate, so it is worth trying: if it does `
+          + `not fit you will get an out-of-memory message rather than a crash.`;
       }
       el.appendChild(note);
     }
@@ -348,14 +353,15 @@ function render(s){
     st.textContent = "Download failed: " + s.download.error;
   } else if (r.state === "error"){
     st.className = "state err";
-    st.textContent = r.error;
+    st.textContent = r.oom
+      ? "Out of memory. The model did not fit at that context length. "
+        + "Try a shorter context, or free some memory."
+      : r.error;
   } else if (r.state === "loading"){
     st.textContent = "Loading the model into memory. A 13 GiB file takes a minute or two.";
   } else if (r.state === "ready"){
     st.className = "state ready";
-    const split = (r.n_gpu_layers !== undefined && r.n_gpu_layers < 99)
-      ? ` ${r.n_gpu_layers} layers on the GPU, the rest on the CPU.` : "";
-    st.textContent = "Ready" + (r.mtp ? ", with multi-token prediction on." : ".") + split;
+    st.textContent = "Ready" + (r.mtp ? ", with multi-token prediction on." : ".");
   } else {
     st.textContent = "No model loaded.";
   }

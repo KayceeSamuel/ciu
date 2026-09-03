@@ -104,7 +104,13 @@ def _detect_metal() -> Hardware | None:
     addressable = int(total * 0.75)
 
     # Free memory: pages that are free or reclaimable. macOS counts inactive
-    # pages as available, and they are, so include them.
+    # pages as available and normally they are.
+    #
+    # But llama.cpp memory-maps the GGUF rather than reading it into a buffer,
+    # and mapped file pages land in "inactive". So once a model is loaded, a
+    # large part of its weights is counted here as free, which is how the page
+    # came to claim 2.75 GiB free with a 4.35 GiB model resident. The caller
+    # subtracts the loaded model back out; see hardware.detect(resident_bytes).
     free = 0
     out = _run(["vm_stat"])
     if out:
@@ -154,9 +160,21 @@ def _detect_cpu() -> Hardware:
     )
 
 
-def detect() -> Hardware:
-    """Return the best backend available, preferring GPU over CPU."""
-    return _detect_cuda() or _detect_metal() or _detect_cpu()
+def detect(resident_bytes: int = 0) -> Hardware:
+    """Return the best backend available, preferring GPU over CPU.
+
+    resident_bytes is memory a model already holds. On unified memory it must
+    be subtracted: llama.cpp maps the weights, mapped pages count as inactive,
+    and inactive counts as free, so without this the model's own weights are
+    reported as available to load another model into.
+
+    CUDA reports device memory directly and already excludes what is in use,
+    so the subtraction only applies to unified memory.
+    """
+    hw = _detect_cuda() or _detect_metal() or _detect_cpu()
+    if resident_bytes and hw.unified:
+        hw.free_bytes = max(hw.free_bytes - resident_bytes, 0)
+    return hw
 
 
 if __name__ == "__main__":

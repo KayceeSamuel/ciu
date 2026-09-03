@@ -18,11 +18,34 @@ from dataclasses import dataclass
 
 GIB = 1024 ** 3
 
-# llama.cpp allocates compute buffers, the logits buffer and CUDA/Metal
-# scratch beyond the weights and cache. Measured at roughly 600MB-1GB on the
-# models tested; we reserve 1GiB so the estimate errs toward refusing rather
-# than promising a model that then fails to allocate.
-OVERHEAD_BYTES = 1 * GIB
+MIB = 1024 ** 2
+
+# Beyond weights and cache, llama.cpp allocates a compute buffer, a logits
+# buffer and some backend scratch. The compute buffer scales with the BATCH
+# size, not the context, which is why -b 2048 costs hundreds of megabytes and
+# -b 128 costs tens.
+#
+# A flat one-gigabyte reserve was the earlier guess here and it was both wrong
+# and harmful: it refused models that run perfectly well, which on an 8GB
+# machine meant refusing everything. The estimate below is smaller and scales
+# with batch. It can still be wrong, so it is advisory: the user may load
+# anyway and the backend's own out-of-memory error is the real answer.
+BASE_OVERHEAD = 192 * MIB          # backend scratch, logits, allocator slack
+DEFAULT_BATCH = 512
+
+
+def overhead_bytes(n_embd: int = 4096, n_batch: int = DEFAULT_BATCH) -> int:
+    """Rough non-weight, non-cache allocation.
+
+    The compute buffer holds a few activation tensors of batch x embedding in
+    fp16. Four is a workable multiplier across the models measured.
+    """
+    compute = 4 * n_batch * n_embd * 2
+    return BASE_OVERHEAD + compute
+
+
+# Kept for callers that have no shape to hand.
+OVERHEAD_BYTES = overhead_bytes()
 
 
 @dataclass
@@ -31,6 +54,7 @@ class ModelShape:
     n_layer: int
     n_head_kv: int
     head_dim: int
+    n_embd: int = 4096
     # Layers using full attention. On a conventional model this equals
     # n_layer. On a hybrid it is only the subset that keeps a growing cache.
     n_attn_layer: int | None = None
@@ -98,10 +122,10 @@ class Budget:
 
 
 def budget_for(weights_bytes: int, shape: ModelShape, available_bytes: int,
-               kv_bits: int = 16) -> Budget:
+               kv_bits: int = 16, n_batch: int = DEFAULT_BATCH) -> Budget:
     return Budget(
         weights_bytes=weights_bytes,
-        overhead_bytes=OVERHEAD_BYTES,
+        overhead_bytes=overhead_bytes(shape.n_embd, n_batch),
         kv_per_token=kv_bytes_per_token(shape, kv_bits),
         available_bytes=available_bytes,
     )
@@ -154,31 +178,17 @@ def context_options(b: "Budget", n_ctx_train: int | None = None) -> list[dict]:
     return out
 
 
-def plan_offload(b: "Budget", n_layer: int, n_ctx: int) -> dict:
-    """How many layers will fit on the GPU.
+def max_fitting_context(b: "Budget", n_ctx_train: int | None = None) -> int:
+    """Largest offered context length that fits entirely in device memory.
 
-    A model that does not fit entirely is not a dead end. llama.cpp will put
-    the first N layers on the GPU and run the rest on CPU. That is much slower
-    than full offload but vastly faster than no offload at all, and on a
-    machine where the model is only slightly too large it is the difference
-    between running and not running.
+    Zero means the model will not load at all: the weights and overhead alone
+    exceed what is free, so no context length helps.
     """
-    needed = b.fixed_bytes + b.kv_bytes_at(n_ctx)
-    if needed <= b.available_bytes:
-        return {"n_gpu_layers": 99, "full": True, "layers_on_gpu": n_layer,
-                "n_layer": n_layer}
-
-    # Weights dominate and divide roughly evenly across layers. The KV cache
-    # and overhead have to be resident regardless.
-    per_layer = b.weights_bytes / max(n_layer, 1)
-    spare = b.available_bytes - b.overhead_bytes - b.kv_bytes_at(n_ctx)
-    if spare <= 0:
-        return {"n_gpu_layers": 0, "full": False, "layers_on_gpu": 0,
-                "n_layer": n_layer}
-
-    # Leave one layer of slack: the estimate is approximate and an allocation
-    # failure mid-load is worse than one fewer layer.
-    fit = max(int(spare // per_layer) - 1, 0)
-    fit = min(fit, n_layer)
-    return {"n_gpu_layers": fit, "full": False, "layers_on_gpu": fit,
-            "n_layer": n_layer}
+    cap = n_ctx_train or CONTEXT_STEPS[-1]
+    best = 0
+    for n in CONTEXT_STEPS:
+        if n > cap:
+            break
+        if b.fixed_bytes + b.kv_bytes_at(n) <= b.available_bytes:
+            best = n
+    return best

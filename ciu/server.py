@@ -19,10 +19,11 @@ import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
 
-from .budget import (GIB, budget_for, context_options, plan_offload,
-                     round_context)
+from .budget import (CONTEXT_STEPS, GIB, budget_for, context_options,
+                     max_fitting_context, round_context)
 from .catalog import CATALOG, by_id
 from .gguf_read import read_shape
+from .gguf_remote import file_size as remote_size, read_remote
 from .hardware import detect
 from .runner import LlamaRunner, RunConfig, find_llama_server
 
@@ -39,42 +40,86 @@ def model_path(model) -> Path:
     return MODEL_DIR / model.filename
 
 
-# Reading a GGUF memory-maps the whole file. The shape never changes, so it is
-# read once per path and cached. Without this the status poll maps a multi-GiB
-# file every 1.5 seconds, which stalls hard on a machine that is already tight
-# on memory.
+# Shapes are read once and cached. Reading a local GGUF memory-maps the whole
+# file, and reading a remote one costs a network round trip, so neither belongs
+# on a status poll that runs every 1.5 seconds.
 _shape_cache: dict[str, object] = {}
+_size_cache: dict[str, int] = {}
 
 
 def shape_for(model):
-    """Prefer the shape in the file over the one recorded in the catalogue."""
+    """The model's real shape, preferring measurement over hand-recorded values.
+
+    Local file first, then the remote header, then the catalogue. The
+    catalogue is a fallback for when the network is unavailable, not the
+    source of truth: values typed by hand go stale and are easy to get wrong,
+    and the numbers shown before download are what someone uses to decide
+    whether to spend the bandwidth.
+    """
     path = model_path(model)
     key = str(path)
 
     if key in _shape_cache:
         return _shape_cache[key] or model.shape
 
-    if not path.is_file():
-        return model.shape
+    if path.is_file():
+        try:
+            shape, _ = read_shape(key)
+        except Exception:
+            shape = None
+        _shape_cache[key] = shape
+        return shape or model.shape
+
+    # Not downloaded. GGUF puts its metadata at the front of the file, so a
+    # range request for the first megabyte answers the same question.
+    remote_key = f"{model.repo}/{model.filename}"
+    if remote_key in _shape_cache:
+        return _shape_cache[remote_key] or model.shape
 
     try:
-        shape, _ = read_shape(key)
+        shape, _ = read_remote(model.repo, model.filename)
     except Exception:
         shape = None
-
-    _shape_cache[key] = shape
+    _shape_cache[remote_key] = shape
     return shape or model.shape
+
+
+def size_for(model) -> int:
+    """Actual file size, from disk or from HuggingFace, falling back to the
+    catalogue. A wrong size here is a wrong fit decision."""
+    path = model_path(model)
+    if path.is_file():
+        return path.stat().st_size
+
+    key = f"{model.repo}/{model.filename}"
+    if key not in _size_cache:
+        _size_cache[key] = remote_size(model.repo, model.filename) or 0
+    return _size_cache[key] or model.size_bytes
 
 
 # ----------------------------------------------------------------- CIU API
 
+def _resident_bytes() -> int:
+    """Memory the loaded model is holding, weights plus cache plus overhead."""
+    if runner.state != "ready" or not runner.config:
+        return 0
+    model = next((m for m in CATALOG
+                  if runner.config.model_path.endswith(m.filename)), None)
+    if not model:
+        return 0
+    shape = shape_for(model)
+    b = budget_for(size_for(model), shape, 0)
+    return b.fixed_bytes + b.kv_bytes_at(runner.config.n_ctx)
+
+
 @app.get("/api/status")
 def status():
     # Runs on every poll, so everything in here must be cheap.
-    hw = detect()
+    resident = _resident_bytes()
+    hw = detect(resident)
 
-    # While a model is loaded its memory is already accounted for in free_bytes
-    # on CUDA. On unified memory it is too, since it comes from system RAM.
+    # free_bytes now excludes whatever the loaded model holds, so this is
+    # genuinely what a second model, or a longer context, could use.
     available = hw.free_bytes
 
     models = []
@@ -82,14 +127,16 @@ def status():
         path = model_path(m)
         downloaded = path.is_file()
         shape = shape_for(m)
-        b = budget_for(m.size_bytes, shape, available)
-        opts = context_options(b, m.n_ctx_train)
-        # Default to the largest context that fits, or the smallest offered if
-        # none do (partial offload will handle the shortfall).
-        fitting = [o for o in opts if o["fits"]]
-        default_ctx = fitting[-1]["n_ctx"] if fitting else opts[0]["n_ctx"]
+        b = budget_for(size_for(m), shape, available)
+        n_ctx_train = getattr(shape, "n_ctx_train", None) or m.n_ctx_train
+        opts = context_options(b, n_ctx_train)
+        # Default to the largest context that fits entirely. Zero means the
+        # model will not load at all on the memory currently free.
+        max_ctx = max_fitting_context(b, n_ctx_train)
+        default_ctx = max_ctx or (opts[0]["n_ctx"] if opts else 0)
 
         entry = m.to_dict()
+        entry["size_gib"] = round(size_for(m) / GIB, 2)
         entry.update({
             "downloaded": downloaded,
             "budget": b.to_dict(),
@@ -97,13 +144,15 @@ def status():
             "kv_per_token": b.kv_per_token,
             "contexts": opts,
             "default_ctx": default_ctx,
+            "max_ctx": max_ctx,
             "n_layer": shape.n_layer,
-            "offload": plan_offload(b, shape.n_layer, default_ctx),
+            "n_ctx_train": n_ctx_train,
         })
         models.append(entry)
 
     return {
         "hardware": hw.to_dict(),
+        "resident_gib": round(resident / GIB, 2),
         "models": models,
         "runner": runner.status(),
         "download": _download,
@@ -151,35 +200,39 @@ def load(model_id: str, n_ctx: int | None = None, mtp: bool = False):
     if not path.is_file():
         raise HTTPException(400, "model not downloaded")
 
-    hw = detect()
+    hw = detect(_resident_bytes())
     shape = shape_for(model)
-    b = budget_for(model.size_bytes, shape, hw.free_bytes)
+    b = budget_for(size_for(model), shape, hw.free_bytes)
 
-    ctx = n_ctx or (round_context(b.max_context) if b.fits else 2048)
+    n_ctx_train = model.n_ctx_train
+    max_ctx = max_fitting_context(b, n_ctx_train)
 
-    # A model that does not fit entirely is not refused. Split it: the first N
-    # layers go on the GPU and the rest run on CPU. Slow, but running.
-    plan = plan_offload(b, shape.n_layer, ctx)
-    if plan["n_gpu_layers"] == 0 and hw.backend != "cpu":
-        raise HTTPException(
-            400,
-            f"Only {hw.free_gib:.1f} GiB is free. Not even one layer of "
-            f"{model.name} fits alongside {ctx} tokens of context.",
-        )
+    # The estimate is advisory, never a veto. It is built from a model of how
+    # llama.cpp allocates, and that model is approximate: an earlier version
+    # of it refused everything on an 8GB machine that in fact runs the model
+    # fine. So CIU says what it expects, then lets the backend be the judge.
+    # If it really does not fit, the OOM is caught and reported plainly.
+    ctx = n_ctx or max_ctx or CONTEXT_STEPS[0]
 
-    # Batch size drives a compute buffer that is charged whatever the context.
-    # Keep it small when memory is tight.
-    n_batch = 128 if not plan["full"] else None
+    expected = (b.fixed_bytes + b.kv_bytes_at(ctx)) / GIB
+    tight = expected > hw.free_gib
 
+    # A smaller batch shrinks the compute buffer, which is worth doing when
+    # memory is the binding constraint.
     runner.start(RunConfig(
         model_path=str(path),
         n_ctx=ctx,
         backend=hw.backend,
         use_mtp=mtp and model.has_mtp,
-        n_gpu_layers=plan["n_gpu_layers"],
-        n_batch=n_batch,
+        n_batch=256 if tight else None,
     ))
-    return {"loading": True, "n_ctx": ctx, "offload": plan}
+    return {
+        "loading": True,
+        "n_ctx": ctx,
+        "expected_gib": round(expected, 2),
+        "free_gib": hw.free_gib,
+        "tight": tight,
+    }
 
 
 @app.post("/api/unload")
@@ -217,6 +270,31 @@ async def proxy(path: str, request: Request):
                                headers=headers,
                                params=request.query_params)
     upstream = await client.send(req, stream=True)
+
+    # A request that overruns the loaded context comes back from llama-server
+    # as a 400 with a message about tokens. Applications tend to surface that
+    # raw, which tells the user nothing useful, so it is rewritten here into
+    # the thing they actually need to do.
+    if upstream.status_code == 400 and runner.config:
+        raw = await upstream.aread()
+        await upstream.aclose()
+        await client.aclose()
+        text = raw.decode("utf-8", "replace").lower()
+        if "context" in text or "n_ctx" in text or "exceed" in text:
+            return JSONResponse(
+                status_code=400,
+                content={"error": {
+                    "message": (
+                        f"This conversation has filled the "
+                        f"{runner.config.n_ctx}-token context. Start a new "
+                        f"conversation, or reload the model with a larger "
+                        f"context if memory allows."),
+                    "type": "ciu_context_full",
+                    "n_ctx": runner.config.n_ctx,
+                }},
+            )
+        return JSONResponse(status_code=400,
+                            content={"error": {"message": raw.decode("utf-8", "replace")}})
 
     async def body_iter():
         try:
