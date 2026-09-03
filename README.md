@@ -8,24 +8,47 @@ speaks OpenAI can point at that address: a chat client, a Blender addon, an
 editor extension. They share one model instance instead of each loading their
 own and running you out of memory.
 
-## What it needs
+## Installing
 
-A build of the NF4DQ llama.cpp fork:
+One line. It installs into `~/.ciu` and touches nothing else.
 
-    git clone https://github.com/KayceeSamuel/llama.cpp
-    cd llama.cpp
-    cmake -B build -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release  # omit -DGGML_CUDA on Apple Silicon
-    cmake --build build -j --target llama-server
+**macOS and Linux**
 
-CIU looks for `llama-server` on PATH, at `~/llama.cpp/build/bin/`, and at
-`~/.ciu/bin/`. Otherwise set `CIU_LLAMA_SERVER` to its path.
+    curl -fsSL https://raw.githubusercontent.com/KayceeSamuel/ciu/main/install.sh | sh
 
-## Running it
+**Windows** (PowerShell)
 
+    irm https://raw.githubusercontent.com/KayceeSamuel/ciu/main/install.ps1 | iex
+
+Then, in a new terminal:
+
+    ciu
+
+Your browser opens at http://127.0.0.1:8674, where you pick a model that fits
+your machine. Everything runs locally: no account, no API key, nothing leaves
+the machine.
+
+To remove it: `rm -rf ~/.ciu`, or on Windows `Remove-Item -Recurse $HOME\.ciu`
+
+Requires macOS on Apple Silicon, Linux x86_64, or 64-bit Windows.
+
+On Windows and Linux you want an NVIDIA GPU. CIU has CUDA and Metal kernels
+but no Vulkan kernel yet, so AMD and Intel GPUs fall back to a CPU path that
+runs at well under one token a second.
+
+## Installing from source
+
+Only needed if you want to change CIU itself.
+
+    git clone https://github.com/KayceeSamuel/ciu
+    cd ciu
     pip install fastapi uvicorn httpx huggingface_hub gguf
     python run.py
 
-Then open http://127.0.0.1:8674
+CIU needs `llama-server` from the NF4DQ fork. It looks on PATH, in
+`~/.ciu/bin/`, and in `~/llama.cpp/build/bin/`; otherwise set
+`CIU_LLAMA_SERVER` to its path. Prebuilt binaries are at
+https://github.com/KayceeSamuel/llama.cpp/releases
 
 ## Connecting a tool
 
