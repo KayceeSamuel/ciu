@@ -40,21 +40,58 @@ def model_path(model) -> Path:
     return MODEL_DIR / model.filename
 
 
-# Shapes are read once and cached. Reading a local GGUF memory-maps the whole
-# file, and reading a remote one costs a network round trip, so neither belongs
-# on a status poll that runs every 1.5 seconds.
+# Measured values are cached, because reading a local GGUF memory-maps the
+# whole file and reading a remote one costs a network round trip. Neither
+# belongs on a status poll that runs every 1.5 seconds.
+#
+# Remote reads happen on a background thread and NEVER inside a request. A
+# machine with nothing downloaded yet would otherwise fetch metadata for every
+# catalogue entry on the first poll, and if HuggingFace is slow or
+# unreachable the page hangs instead of loading. That is the state every new
+# user starts in, so it is the worst possible place to block.
 _shape_cache: dict[str, object] = {}
 _size_cache: dict[str, int] = {}
+_remote_pending: set[str] = set()
+_remote_lock = threading.Lock()
+
+
+def _fetch_remote(model):
+    """Read a model's real shape and size from HuggingFace, off-thread."""
+    key = f"{model.repo}/{model.filename}"
+    try:
+        shape, _ = read_remote(model.repo, model.filename)
+    except Exception:
+        shape = None
+    try:
+        size = remote_size(model.repo, model.filename)
+    except Exception:
+        size = None
+
+    with _remote_lock:
+        _shape_cache[key] = shape
+        if size:
+            _size_cache[key] = size
+        _remote_pending.discard(key)
+
+
+def _want_remote(model):
+    """Ask for a remote read if one is not already done or running."""
+    key = f"{model.repo}/{model.filename}"
+    with _remote_lock:
+        if key in _shape_cache or key in _remote_pending:
+            return
+        _remote_pending.add(key)
+    threading.Thread(target=_fetch_remote, args=(model,), daemon=True).start()
 
 
 def shape_for(model):
     """The model's real shape, preferring measurement over hand-recorded values.
 
-    Local file first, then the remote header, then the catalogue. The
-    catalogue is a fallback for when the network is unavailable, not the
-    source of truth: values typed by hand go stale and are easy to get wrong,
-    and the numbers shown before download are what someone uses to decide
-    whether to spend the bandwidth.
+    Local file, then whatever the background read has returned, then the
+    catalogue. The catalogue is a fallback rather than the source of truth:
+    hand-typed values go stale and are easy to get wrong, and the numbers
+    shown before download are what someone uses to decide whether to spend
+    the bandwidth. But it is what gets shown until the network answers.
     """
     path = model_path(model)
     key = str(path)
@@ -70,31 +107,28 @@ def shape_for(model):
         _shape_cache[key] = shape
         return shape or model.shape
 
-    # Not downloaded. GGUF puts its metadata at the front of the file, so a
-    # range request for the first megabyte answers the same question.
     remote_key = f"{model.repo}/{model.filename}"
     if remote_key in _shape_cache:
         return _shape_cache[remote_key] or model.shape
 
-    try:
-        shape, _ = read_remote(model.repo, model.filename)
-    except Exception:
-        shape = None
-    _shape_cache[remote_key] = shape
-    return shape or model.shape
+    _want_remote(model)
+    return model.shape
 
 
 def size_for(model) -> int:
-    """Actual file size, from disk or from HuggingFace, falling back to the
-    catalogue. A wrong size here is a wrong fit decision."""
+    """Actual file size, from disk or from a completed background read,
+    falling back to the catalogue. A wrong size here is a wrong fit
+    decision, but a hung page is worse than a slightly stale number."""
     path = model_path(model)
     if path.is_file():
         return path.stat().st_size
 
     key = f"{model.repo}/{model.filename}"
-    if key not in _size_cache:
-        _size_cache[key] = remote_size(model.repo, model.filename) or 0
-    return _size_cache[key] or model.size_bytes
+    if key in _size_cache:
+        return _size_cache[key] or model.size_bytes
+
+    _want_remote(model)
+    return model.size_bytes
 
 
 # ----------------------------------------------------------------- CIU API
