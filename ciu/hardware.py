@@ -8,6 +8,7 @@ system memory and the driver caps how much it will hand over.
 
 from __future__ import annotations
 
+import os
 import platform
 import re
 import shutil
@@ -135,28 +136,103 @@ def _detect_metal() -> Hardware | None:
     )
 
 
-def _detect_cpu() -> Hardware:
-    total = 0
-    if platform.system() == "Linux":
+def _cpu_name() -> str:
+    """A readable processor name.
+
+    platform.processor() returns something useful on macOS and often
+    something unreadable elsewhere: on Windows it gives strings like
+    "ARMv8 (64-bit) Family 8 Model 0 Revision 0, QEMU". Prefer the
+    platform-specific sources and fall back only when they fail.
+    """
+    sysname = platform.system()
+
+    if sysname == "Windows":
+        name = os.environ.get("PROCESSOR_IDENTIFIER", "")
+        # Strip the family/model/stepping tail, which is noise to a user.
+        name = re.sub(r"\s*(Family|Model|Stepping).*$", "", name).strip()
+        if name:
+            return name
+
+    if sysname == "Linux":
+        try:
+            with open("/proc/cpuinfo") as f:
+                for line in f:
+                    if line.startswith("model name"):
+                        return line.split(":", 1)[1].strip()
+        except OSError:
+            pass
+
+    if sysname == "Darwin":
+        out = _run(["sysctl", "-n", "machdep.cpu.brand_string"])
+        if out:
+            return out.strip()
+
+    return platform.processor() or platform.machine() or "unknown CPU"
+
+
+def _memory_bytes() -> tuple[int, int]:
+    """(total, available) system memory, per platform."""
+    sysname = platform.system()
+
+    if sysname == "Windows":
+        # Windows has no /proc. GlobalMemoryStatusEx is the documented call
+        # and needs no third-party package.
+        import ctypes
+
+        class MEMORYSTATUSEX(ctypes.Structure):
+            _fields_ = [
+                ("dwLength", ctypes.c_ulong),
+                ("dwMemoryLoad", ctypes.c_ulong),
+                ("ullTotalPhys", ctypes.c_ulonglong),
+                ("ullAvailPhys", ctypes.c_ulonglong),
+                ("ullTotalPageFile", ctypes.c_ulonglong),
+                ("ullAvailPageFile", ctypes.c_ulonglong),
+                ("ullTotalVirtual", ctypes.c_ulonglong),
+                ("ullAvailVirtual", ctypes.c_ulonglong),
+                ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+            ]
+
+        try:
+            st = MEMORYSTATUSEX()
+            st.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+            ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(st))
+            return int(st.ullTotalPhys), int(st.ullAvailPhys)
+        except Exception:
+            return 0, 0
+
+    if sysname == "Linux":
+        total = avail = 0
         try:
             with open("/proc/meminfo") as f:
                 for line in f:
                     if line.startswith("MemTotal:"):
                         total = int(line.split()[1]) * 1024
-                    if line.startswith("MemAvailable:"):
-                        free = int(line.split()[1]) * 1024
+                    elif line.startswith("MemAvailable:"):
+                        avail = int(line.split()[1]) * 1024
         except OSError:
             pass
-    free = locals().get("free", int(total * 0.5))
+        return total, (avail or int(total * 0.5))
+
+    if sysname == "Darwin":
+        out = _run(["sysctl", "-n", "hw.memsize"])
+        total = int(out.strip()) if out else 0
+        return total, int(total * 0.5)
+
+    return 0, 0
+
+
+def _detect_cpu() -> Hardware:
+    total, free = _memory_bytes()
 
     return Hardware(
         backend="cpu",
-        device_name=platform.processor() or platform.machine(),
+        device_name=_cpu_name(),
         total_bytes=total,
         free_bytes=free,
         unified=True,
         note="No supported GPU found. NF4DQ has no SIMD CPU kernel, so "
-             "generation will be very slow.",
+             "generation will be very slow. CIU needs an NVIDIA GPU on "
+             "Windows or Linux, or Apple Silicon on a Mac.",
     )
 
 

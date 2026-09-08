@@ -317,7 +317,10 @@ async def proxy(path: str, request: Request):
 @app.get("/", response_class=HTMLResponse)
 def index():
     page = Path(__file__).parent / "static" / "index.html"
-    return page.read_text()
+    # The charset must be explicit. Without it Edge falls back to Windows-1252
+    # and every non-ASCII character in the page renders as mojibake.
+    return HTMLResponse(page.read_text(encoding="utf-8"),
+                        media_type="text/html; charset=utf-8")
 
 
 def main():
